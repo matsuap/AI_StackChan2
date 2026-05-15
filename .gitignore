@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Frontend
+webui/frontend/node_modules/
+webui/frontend/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+.claude/

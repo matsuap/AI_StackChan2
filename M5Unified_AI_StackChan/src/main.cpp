@@ -208,7 +208,7 @@ static const char ROLE_HTML[] PROGMEM = R"KEWL(
 String speech_text = "";
 String speech_text_buffer = "";
 DynamicJsonDocument chat_doc(1024*10);
-String json_ChatString = "{\"model\": \"gpt-4o-mini\",\"messages\": [{\"role\": \"user\", \"content\": \"""\"}]}";
+String json_ChatString = "{\"model\": \"gpt-4o-mini\",\"temperature\": 0.7,\"max_tokens\": 500,\"messages\": [{\"role\": \"user\", \"content\": \"""\"}]}";
 String Role_JSON = "";
 
 bool init_chat_doc(const char *data)
@@ -672,8 +672,8 @@ void StatusCallback(void *cbData, int code, const char *string)
 
 #ifdef USE_SERVO
 #define START_DEGREE_VALUE_X 90
-//#define START_DEGREE_VALUE_Y 90
-#define START_DEGREE_VALUE_Y 85 //
+#define START_DEGREE_VALUE_Y 65
+// #define START_DEGREE_VALUE_Y 85
 ServoEasing servo_x;
 ServoEasing servo_y;
 #endif
@@ -700,7 +700,12 @@ void lipSync(void *args)
   }
 }
 
+// #define SERVO_AUTO_MOVE  // コメントアウト=固定(デフォルト), 有効=自発移動
+#ifdef SERVO_AUTO_MOVE
 bool servo_home = false;
+#else
+bool servo_home = true;
+#endif
 
 void servo(void *args)
 {
@@ -710,6 +715,7 @@ void servo(void *args)
   for (;;)
   {
 #ifdef USE_SERVO
+#ifdef SERVO_AUTO_MOVE
     if(!servo_home)
     {
     avatar->getGaze(&gazeY, &gazeX);
@@ -724,12 +730,13 @@ void servo(void *args)
     } else {
 //     avatar->setRotation(gazeX * 5);
 //     float b = avatar->getBreath();
-       servo_x.setEaseTo(START_DEGREE_VALUE_X); 
+       servo_x.setEaseTo(START_DEGREE_VALUE_X);
 //     servo_y.setEaseTo(START_DEGREE_VALUE_Y + b * 5);
        servo_y.setEaseTo(START_DEGREE_VALUE_Y);
     }
     synchronizeAllServosStartAndWaitForAllServosToStop();
-#endif
+#endif  // SERVO_AUTO_MOVE
+#endif  // USE_SERVO
     delay(50);
   }
 }
@@ -1281,7 +1288,11 @@ void loop()
 #ifdef USE_SERVO
       if (box_servo.contain(t.x, t.y))
       {
+#ifdef SERVO_AUTO_MOVE
         servo_home = !servo_home;
+#else
+        servo_home = true;
+#endif
         M5.Speaker.tone(1000, 100);
       }
 #endif
@@ -1335,7 +1346,7 @@ void loop()
       avatar.setSpeechText("");
       mode = 0;
       wakeword_is_enable = false;
-#ifdef USE_SERVO
+#if defined(USE_SERVO) && defined(SERVO_AUTO_MOVE)
       servo_home = false;
 #endif
     }
