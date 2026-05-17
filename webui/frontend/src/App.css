@@ -89,9 +89,7 @@ label {
   padding-top: 9px;
 }
 
-input[type="text"],
-input[type="password"],
-input[type="number"],
+input:not([type="range"]),
 select {
   background: #0c0e16;
   border: 1px solid #2a3347;
@@ -106,6 +104,7 @@ select {
 }
 input:focus, select:focus { border-color: #4299e1; }
 input[type="password"] { font-family: monospace; letter-spacing: 0.1em; }
+input[type="range"] { background: transparent !important; border: none !important; padding: 0 !important; }
 
 .num-small {
   width: 80px !important;
@@ -248,6 +247,93 @@ input[type="password"] { font-family: monospace; letter-spacing: 0.1em; }
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
 }
+
+/* ── Accordion ── */
+.accordion-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+  margin-bottom: 0;
+}
+
+.accordion-header h2 {
+  margin: 0;
+}
+
+.accordion-header.open h2 {
+  margin-bottom: 16px;
+}
+
+.accordion-arrow {
+  font-size: 12px;
+  color: #4a5568;
+}
+
+/* ── Tab bar ── */
+.tab-bar {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid #1e2535;
+  background: #12151f;
+  padding: 0 24px;
+}
+
+.tab-btn {
+  padding: 12px 24px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: #718096;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  margin-bottom: -1px;
+}
+.tab-btn:hover { color: #e2e8f0; }
+.tab-btn.active {
+  color: #90cdf4;
+  border-bottom-color: #4299e1;
+}
+
+/* ── Voice change ── */
+.voice-action {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.btn-voice {
+  padding: 8px 24px;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  background: #3182ce;
+  color: #fff;
+  transition: background 0.15s, opacity 0.15s;
+}
+.btn-voice:hover:not(:disabled) { background: #2b6cb0; }
+.btn-voice:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn-voice.ok { background: #276749; }
+.btn-voice.error { background: #9b2c2c; }
+
+.voice-status {
+  font-size: 13px;
+  font-weight: 500;
+}
+.voice-status.sending { color: #a0aec0; }
+.voice-status.ok { color: #68d391; }
+.voice-status.error { color: #fc8181; }
 
 /* ── Terminal ── */
 .terminal {

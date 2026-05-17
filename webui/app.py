@@ -1,7 +1,12 @@
 import asyncio
 import json
+import queue
 import re
 import shutil
+import subprocess
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import serial.tools.list_ports
@@ -11,6 +16,25 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
+
+# ---------------------------------------------------------------------------
+# Error message variable mapping (config key → C++ variable name)
+# ---------------------------------------------------------------------------
+
+_ERR_MSGS = {
+    'err_client':    'ERR_MSG_CLIENT',
+    'err_connect':   'ERR_MSG_CONNECT',
+    'err_timeout':   'ERR_MSG_TIMEOUT',
+    'err_401':       'ERR_MSG_401',
+    'err_429':       'ERR_MSG_429',
+    'err_400':       'ERR_MSG_400',
+    'err_404':       'ERR_MSG_404',
+    'err_5xx':       'ERR_MSG_5XX',
+    'err_empty':     'ERR_MSG_EMPTY',
+    'err_nomemory':  'ERR_MSG_NOMEMORY',
+    'err_parse':     'ERR_MSG_PARSE',
+    'err_nocontent': 'ERR_MSG_NOCONTENT',
+}
 
 # ---------------------------------------------------------------------------
 # Model categories
@@ -30,18 +54,20 @@ def _model_type(model: str) -> str:
         return 'standard'
     return 'gpt5'
 
-# Messages placeholder as it appears in the .cpp file
-_MSGS = ',\\"messages\\": [{\\"role\\": \\"user\\", \\"content\\": \\"' + '""' + '\\"' + '}]}'
+# Responses API placeholders as they appear in the .cpp file
+_TOOLS_STR = ',\\"tools\\": [{\\"type\\": \\"web_search_preview\\"}]'
+_MSGS      = ',\\"input\\": []}'
 
-def _build_json_chat_str(model: str, temperature: str, max_tokens: str, reasoning_effort: str) -> str:
+def _build_json_chat_str(model: str, temperature: str, max_tokens: str, reasoning_effort: str, use_web_search: bool) -> str:
     mt = _model_type(model)
     if mt == 'reasoning':
-        params = f'\\"model\\": \\"{model}\\",\\"max_completion_tokens\\": {max_tokens},\\"reasoning_effort\\": \\"{reasoning_effort}\\"'
+        params = f'\\"model\\": \\"{model}\\",\\"max_output_tokens\\": {max_tokens},\\"reasoning_effort\\": \\"{reasoning_effort}\\"'
     elif mt == 'gpt5':
-        params = f'\\"model\\": \\"{model}\\",\\"max_completion_tokens\\": {max_tokens}'
+        params = f'\\"model\\": \\"{model}\\",\\"max_output_tokens\\": {max_tokens}'
     else:
-        params = f'\\"model\\": \\"{model}\\",\\"temperature\\": {temperature},\\"max_tokens\\": {max_tokens}'
-    return '{' + params + _MSGS
+        params = f'\\"model\\": \\"{model}\\",\\"temperature\\": {temperature},\\"max_output_tokens\\": {max_tokens}'
+    tools = _TOOLS_STR if use_web_search else ''
+    return '{' + params + tools + _MSGS
 
 
 ROOT = Path(__file__).parent.parent
@@ -87,13 +113,16 @@ def read_config() -> dict:
         "stt_apikey":         find(r'^#define STT_APIKEY "([^"]*)"', re.MULTILINE),
         "servo_x_angle":      find(r'^#define START_DEGREE_VALUE_X (\d+)', re.MULTILINE),
         "servo_y_angle":      find(r'^#define START_DEGREE_VALUE_Y (\d+)', re.MULTILINE),
-        "tts_speaker_no":     find(r'String TTS_SPEAKER_NO = "(\d+)";'),
+        "openai_response_buffer": find(r'^#define OPENAI_RESPONSE_BUFFER (\d+)', re.MULTILINE) or '12288',
         "openai_model":        find(r'\\"model\\": \\"([\w.-]+)\\"'),
         "openai_temperature":  find(r'\\"temperature\\": ([\d.]+)') or '0.7',
-        "openai_max_tokens":   (find(r'\\"max_tokens\\": (\d+)') or
-                                find(r'\\"max_completion_tokens\\": (\d+)') or '500'),
+        "openai_max_tokens":   find(r'\\"max_output_tokens\\": (\d+)') or '500',
         "reasoning_effort":    find(r'\\"reasoning_effort\\": \\"(\w+)\\"') or 'medium',
+        "use_web_search":      bool(re.search(r'web_search_preview', content)),
+        "system_role":         find(r'^String SYSTEM_ROLE_TEXT = "([^"]*)";', re.MULTILINE),
         "board_env":           find_ini(r'default_envs\s*=\s*(\S+)'),
+        **{k: (find(rf'^String {v} = "([^"]*)";', re.MULTILINE) or None)
+           for k, v in _ERR_MSGS.items()},
     }
 
 
@@ -140,17 +169,28 @@ def write_config(cfg: dict) -> None:
     if "tts_speaker_no" in cfg:
         v = str(cfg["tts_speaker_no"])
         sub(r'(String TTS_SPEAKER_NO = ")\d+(")', lambda m: m.group(1) + v + m.group(2))
-    _JSON_KEYS = {'openai_model', 'openai_temperature', 'openai_max_tokens', 'reasoning_effort'}
+    if "openai_response_buffer" in cfg:
+        v = str(cfg["openai_response_buffer"])
+        sub(r'^(#define OPENAI_RESPONSE_BUFFER )\d+', lambda m: m.group(1) + v, re.MULTILINE)
+    if "system_role" in cfg:
+        v = cfg["system_role"].replace('\\', '\\\\').replace('"', '\\"')
+        sub(r'^(String SYSTEM_ROLE_TEXT = ")[^"]*(")', lambda m: m.group(1) + v + m.group(2), re.MULTILINE)
+    for cfg_key, cpp_var in _ERR_MSGS.items():
+        if cfg_key in cfg:
+            v = cfg[cfg_key].replace('\\', '\\\\').replace('"', '\\"')
+            sub(rf'^(String {cpp_var} = ")[^"]*(")',
+                lambda m, v=v: m.group(1) + v + m.group(2), re.MULTILINE)
+    _JSON_KEYS = {'openai_model', 'openai_temperature', 'openai_max_tokens', 'reasoning_effort', 'use_web_search'}
     if _JSON_KEYS & set(cfg.keys()):
         def _extract(pattern, default=''):
             m = re.search(pattern, c)
             return m.group(1) if m else default
-        model     = str(cfg.get('openai_model',      _extract(r'\\"model\\": \\"([\w.-]+)\\"', 'gpt-4o-mini')))
-        temp      = str(cfg.get('openai_temperature', _extract(r'\\"temperature\\": ([\d.]+)', '0.7')))
-        tokens    = str(cfg.get('openai_max_tokens',  _extract(r'\\"max_tokens\\": (\d+)') or
-                                                      _extract(r'\\"max_completion_tokens\\": (\d+)') or '500'))
-        effort    = str(cfg.get('reasoning_effort',   _extract(r'\\"reasoning_effort\\": \\"(\w+)\\"', 'medium')))
-        new_str   = _build_json_chat_str(model, temp, tokens, effort)
+        model      = str(cfg.get('openai_model',      _extract(r'\\"model\\": \\"([\w.-]+)\\"', 'gpt-4o-mini')))
+        temp       = str(cfg.get('openai_temperature', _extract(r'\\"temperature\\": ([\d.]+)', '0.7')))
+        tokens     = str(cfg.get('openai_max_tokens',  _extract(r'\\"max_output_tokens\\": (\d+)') or '500'))
+        effort     = str(cfg.get('reasoning_effort',   _extract(r'\\"reasoning_effort\\": \\"(\w+)\\"', 'medium')))
+        web_search = bool(cfg.get('use_web_search', bool(re.search(r'web_search_preview', c))))
+        new_str = _build_json_chat_str(model, temp, tokens, effort, web_search)
         sub(r'^String json_ChatString = .*?;$',
             lambda _: f'String json_ChatString = "{new_str}";',
             re.MULTILINE)
@@ -185,24 +225,52 @@ async def api_ports(request: Request) -> JSONResponse:
 
 
 async def _sse_stream(cmd: list, cwd: Path):
-    async def generator():
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+    q: queue.Queue = queue.Queue()
+
+    def _run():
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             cwd=str(cwd),
         )
-        async for line in proc.stdout:
-            text = line.decode("utf-8", errors="replace")
-            yield f"data: {json.dumps(text)}\n\n"
-        code = await proc.wait()
-        yield f"data: {json.dumps({'exit': code})}\n\n"
+        for raw in proc.stdout:
+            q.put(raw)
+        proc.stdout.close()
+        q.put({"exit": proc.wait()})
+
+    async def generator():
+        loop = asyncio.get_event_loop()
+        threading.Thread(target=_run, daemon=True).start()
+        while True:
+            item = await loop.run_in_executor(None, q.get)
+            if isinstance(item, dict):
+                yield f"data: {json.dumps(item)}\n\n"
+                break
+            yield f"data: {json.dumps(item.decode('utf-8', errors='replace'))}\n\n"
 
     return StreamingResponse(
         generator(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+async def api_voice(request: Request) -> JSONResponse:
+    data = await request.json()
+    speaker = data.get("speaker")
+    if not isinstance(speaker, int) or not (0 <= speaker <= 60):
+        return JSONResponse({"error": "speaker must be an integer 0–60"}, status_code=400)
+    url = f"http://stack-chan.local/setting?speaker={speaker}"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+        return JSONResponse({"ok": True, "response": body})
+    except (urllib.error.URLError, OSError) as exc:
+        return JSONResponse(
+            {"error": f"デバイスが見つかりません。同一ネットワークに接続されていることを確認してください ({exc})"},
+            status_code=502,
+        )
 
 
 async def api_build(request: Request):
@@ -225,6 +293,7 @@ routes = [
     Route("/api/config", api_get_config, methods=["GET"]),
     Route("/api/config", api_post_config, methods=["POST"]),
     Route("/api/ports", api_ports, methods=["GET"]),
+    Route("/api/voice", api_voice, methods=["POST"]),
     Route("/api/build", api_build, methods=["GET"]),
     Route("/api/upload", api_upload, methods=["GET"]),
 ]
@@ -244,4 +313,4 @@ if __name__ == "__main__":
     import uvicorn
     print(f"PIO command: {PIO_CMD}")
     print(f"Serving at http://localhost:8080")
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True, reload_dirs=[str(Path(__file__).parent)])

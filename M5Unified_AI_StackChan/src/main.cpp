@@ -39,6 +39,7 @@ const int MAX_HISTORY = 5;
 std::deque<String> chatHistory;
 
 #define USE_SDCARD
+#define OPENAI_RESPONSE_BUFFER 12288
 #define WIFI_SSID "SET YOUR WIFI SSID"
 #define WIFI_PASS "SET YOUR WIFI PASS"
 #define OPENAI_APIKEY "SET YOUR OPENAI APIKEY"
@@ -89,7 +90,7 @@ ESP32WebServer server(80);
 String OPENAI_API_KEY = "";
 String VOICEVOX_API_KEY = "";
 String STT_API_KEY = "";
-String TTS_SPEAKER_NO = "3";
+String TTS_SPEAKER_NO = "39";
 String TTS_SPEAKER = "&speaker=";
 String TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
 //---------------------------------------------
@@ -208,7 +209,20 @@ static const char ROLE_HTML[] PROGMEM = R"KEWL(
 String speech_text = "";
 String speech_text_buffer = "";
 DynamicJsonDocument chat_doc(1024*10);
-String json_ChatString = "{\"model\": \"gpt-4o-mini\",\"temperature\": 0.7,\"max_tokens\": 500,\"messages\": [{\"role\": \"user\", \"content\": \"""\"}]}";
+String json_ChatString = "{\"model\": \"gpt-4o-mini\",\"temperature\": 0.7,\"max_output_tokens\": 500,\"tools\": [{\"type\": \"web_search_preview\"}],\"input\": []}";
+String SYSTEM_ROLE_TEXT = "あなたはスタックチャン(StackChan)です。手のひらサイズの小型AIロボットで、明るく元気でフレンドリーな性格です。返答は必ず日本語で、1〜2文の短い文章にしてください。出典・URL・参考文献・番号は絶対に含めないでください。";
+String ERR_MSG_CLIENT    = "通信モジュールが使えません";
+String ERR_MSG_CONNECT   = "OpenAIに接続できませんでした";
+String ERR_MSG_TIMEOUT   = "通信タイムアウトです";
+String ERR_MSG_401       = "APIキーが正しくありません";
+String ERR_MSG_429       = "API利用制限に達しました";
+String ERR_MSG_400       = "リクエストが不正です";
+String ERR_MSG_404       = "モデルが見つかりません";
+String ERR_MSG_5XX       = "OpenAIのサーバーエラーです";
+String ERR_MSG_EMPTY     = "応答が空でした";
+String ERR_MSG_NOMEMORY  = "応答が大きすぎます";
+String ERR_MSG_PARSE     = "応答の解析に失敗しました";
+String ERR_MSG_NOCONTENT = "応答内容が空でした";
 String Role_JSON = "";
 
 bool init_chat_doc(const char *data)
@@ -259,45 +273,37 @@ void handle_speech() {
   server.send(200, "text/plain", String("OK"));
 }
 
-String https_post_json(const char* url, const char* json_string, const char* root_ca) {
+String https_post_json(const char* url, const char* json_string, const char* root_ca, int& out_http_code) {
   String payload = "";
+  out_http_code = -1000;
   WiFiClientSecure *client = new WiFiClientSecure;
   if(client) {
     client -> setCACert(root_ca);
     {
-      // Add a scoping block for HTTPClient https to make sure it is destroyed before WiFiClientSecure *client is 
       HTTPClient https;
-      https.setTimeout( 65000 ); 
-  
+      https.setTimeout(65000);
       Serial.print("[HTTPS] begin...\n");
-      if (https.begin(*client, url)) {  // HTTPS
+      if (https.begin(*client, url)) {
         Serial.print("[HTTPS] POST...\n");
-        // start connection and send HTTP header
         https.addHeader("Content-Type", "application/json");
         https.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
         int httpCode = https.POST((uint8_t *)json_string, strlen(json_string));
-  
-        // httpCode will be negative on error
+        out_http_code = httpCode;
         if (httpCode > 0) {
-          // HTTP header has been send and Server response header has been handled
           Serial.printf("[HTTPS] POST... code: %d\n", httpCode);
-  
-          // file found at server
-          if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
-            payload = https.getString();
-            Serial.println("//////////////");
-            Serial.println(payload);
-            Serial.println("//////////////");
-          }
+          payload = https.getString();
+          Serial.println("//////////////");
+          Serial.println(payload);
+          Serial.println("//////////////");
         } else {
           Serial.printf("[HTTPS] POST... failed, error: %s\n", https.errorToString(httpCode).c_str());
-        }  
+        }
         https.end();
       } else {
         Serial.printf("[HTTPS] Unable to connect\n");
+        out_http_code = -999;
       }
-      // End extra scoping block
-    }  
+    }
     delete client;
   } else {
     Serial.println("Unable to create client");
@@ -305,39 +311,145 @@ String https_post_json(const char* url, const char* json_string, const char* roo
   return payload;
 }
 
+String sanitize_response(const String& raw) {
+  int len = raw.length();
+  int i = 0;
+  String s;
+  s.reserve(len);
+
+  // Strip 【...】 web search citation blocks (UTF-8: 【=E3 80 90, 】=E3 80 91)
+  while (i < len) {
+    if (i + 2 < len &&
+        (uint8_t)raw[i]==0xE3 && (uint8_t)raw[i+1]==0x80 && (uint8_t)raw[i+2]==0x90) {
+      i += 3;
+      while (i < len) {
+        if (i + 2 < len &&
+            (uint8_t)raw[i]==0xE3 && (uint8_t)raw[i+1]==0x80 && (uint8_t)raw[i+2]==0x91) {
+          i += 3; break;
+        }
+        i++;
+      }
+    } else {
+      s += raw[i++];
+    }
+  }
+
+  // Strip markdown, [N] refs, URLs; normalize newlines
+  String out;
+  out.reserve(s.length());
+  len = s.length();
+  i = 0;
+  while (i < len) {
+    // ** bold marker
+    if (i + 1 < len && s[i] == '*' && s[i+1] == '*') { i += 2; continue; }
+    // * italic marker
+    if (s[i] == '*') { i++; continue; }
+    // [N] citation marker
+    if (s[i] == '[') {
+      int j = i + 1;
+      while (j < len && s[j] >= '0' && s[j] <= '9') j++;
+      if (j > i + 1 && j < len && s[j] == ']') { i = j + 1; continue; }
+    }
+    // URLs
+    if (s[i] == 'h' && i + 6 < len &&
+        (s.substring(i, i+8) == "https://" || s.substring(i, i+7) == "http://")) {
+      while (i < len && s[i] != ' ' && s[i] != '\n' && s[i] != '\r') i++;
+      continue;
+    }
+    // newlines → space
+    if (s[i] == '\n' || s[i] == '\r') { out += ' '; i++; continue; }
+    out += s[i++];
+  }
+
+  // Collapse multiple spaces
+  String fin;
+  fin.reserve(out.length());
+  bool sp = false;
+  for (int j = 0; j < (int)out.length(); j++) {
+    if (out[j] == ' ') { if (!sp) fin += ' '; sp = true; }
+    else               { fin += out[j]; sp = false; }
+  }
+  fin.trim();
+  return fin;
+}
+
+void speak_error(const char* msg) {
+  avatar.setExpression(Expression::Sad);
+  avatar.setSpeechText(msg);
+  delay(2000);
+  avatar.setSpeechText("");
+  avatar.setExpression(Expression::Neutral);
+}
+
 String chatGpt(String json_string) {
-  String response = "";;
+  String response = "";
   avatar.setExpression(Expression::Doubt);
   avatar.setSpeechText("考え中…");
-  String ret = https_post_json("https://api.openai.com/v1/chat/completions", json_string.c_str(), root_ca_openai);
+  int http_code = 0;
+  String ret = https_post_json("https://api.openai.com/v1/responses", json_string.c_str(), root_ca_openai, http_code);
   avatar.setExpression(Expression::Neutral);
   avatar.setSpeechText("");
-  Serial.println(ret);
-  if(ret != ""){
-    DynamicJsonDocument doc(2000);
+  Serial.printf("[chatGpt] http_code=%d ret_len=%d\n", http_code, ret.length());
+
+  if (http_code == -1000) {
+    response = ERR_MSG_CLIENT;    speak_error(response.c_str());
+  } else if (http_code == -999) {
+    response = ERR_MSG_CONNECT;   speak_error(response.c_str());
+  } else if (http_code < 0) {
+    response = ERR_MSG_TIMEOUT;   speak_error(response.c_str());
+  } else if (http_code == 401) {
+    response = ERR_MSG_401;       speak_error(response.c_str());
+  } else if (http_code == 429) {
+    response = ERR_MSG_429;       speak_error(response.c_str());
+  } else if (http_code == 400) {
+    response = ERR_MSG_400;       speak_error(response.c_str());
+  } else if (http_code == 404) {
+    response = ERR_MSG_404;       speak_error(response.c_str());
+  } else if (http_code >= 500) {
+    response = ERR_MSG_5XX;       speak_error(response.c_str());
+  } else if (http_code != HTTP_CODE_OK && http_code != HTTP_CODE_MOVED_PERMANENTLY) {
+    response = String("HTTPエラー") + http_code + "です";
+    speak_error(response.c_str());
+  } else if (ret.length() == 0) {
+    response = ERR_MSG_EMPTY;     speak_error(response.c_str());
+  } else {
+    DynamicJsonDocument doc(OPENAI_RESPONSE_BUFFER);
     DeserializationError error = deserializeJson(doc, ret.c_str());
     if (error) {
       Serial.print(F("deserializeJson() failed: "));
       Serial.println(error.f_str());
-      avatar.setExpression(Expression::Sad);
-      avatar.setSpeechText("エラーです");
-      response = "エラーです";
-      delay(1000);
-      avatar.setSpeechText("");
-      avatar.setExpression(Expression::Neutral);
-    }else{
-      const char* data = doc["choices"][0]["message"]["content"];
-      Serial.println(data);
-      response = String(data);
-      std::replace(response.begin(),response.end(),'\n',' ');
+      response = (error == DeserializationError::NoMemory) ? ERR_MSG_NOMEMORY : ERR_MSG_PARSE;
+      speak_error(response.c_str());
+    } else {
+      Serial.printf("[DBG] memUsage=%d\n", doc.memoryUsage());
+      const char* data = nullptr;
+      JsonArray output = doc["output"];
+      Serial.printf("[DBG] output.size=%d\n", output.size());
+      for (JsonVariant item : output) {
+        const char* itemType = item["type"] | "null";
+        Serial.printf("[DBG] item.type=%s\n", itemType);
+        if (strcmp(itemType, "message") == 0) {
+          JsonArray content = item["content"];
+          Serial.printf("[DBG] content.size=%d\n", content.size());
+          if (content.size() > 0) {
+            JsonVariant elem = content[0];
+            Serial.print("[DBG] content[0]=");
+            serializeJson(elem, Serial);
+            Serial.println();
+            const char* text = elem["text"].as<const char*>();
+            Serial.printf("[DBG] text=%s\n", text ? text : "null");
+            data = text;
+          }
+          break;
+        }
+      }
+      if (data == nullptr || strlen(data) == 0) {
+        response = ERR_MSG_NOCONTENT; speak_error(response.c_str());
+      } else {
+        Serial.println(data);
+        response = sanitize_response(String(data));
+      }
     }
-  } else {
-    avatar.setExpression(Expression::Sad);
-    avatar.setSpeechText("わかりません");
-    response = "わかりません";
-    delay(1000);
-    avatar.setSpeechText("");
-    avatar.setExpression(Expression::Neutral);
   }
   return response;
 }
@@ -365,7 +477,7 @@ void handle_chat() {
 
   for (int i = 0; i < chatHistory.size(); i++)
   {
-    JsonArray messages = chat_doc["messages"];
+    JsonArray messages = chat_doc["input"];
     JsonObject systemMessage1 = messages.createNestedObject();
     if(i % 2 == 0) {
       systemMessage1["role"] = "user";
@@ -415,7 +527,7 @@ void exec_chatGPT(String text) {
 
   for (int i = 0; i < chatHistory.size(); i++)
   {
-    JsonArray messages = chat_doc["messages"];
+    JsonArray messages = chat_doc["input"];
     JsonObject systemMessage1 = messages.createNestedObject();
     if(i % 2 == 0) {
       systemMessage1["role"] = "user";
@@ -533,16 +645,9 @@ void handle_role_set() {
     return;
   }
   String role = server.arg("plain");
+  init_chat_doc(json_ChatString.c_str());
   if (role != "") {
-//    init_chat_doc(InitBuffer.c_str());
-    init_chat_doc(json_ChatString.c_str());
-    JsonArray messages = chat_doc["messages"];
-    JsonObject systemMessage1 = messages.createNestedObject();
-    systemMessage1["role"] = "system";
-    systemMessage1["content"] = role;
-//    serializeJson(chat_doc, InitBuffer);
-  } else {
-    init_chat_doc(json_ChatString.c_str());
+    chat_doc["instructions"] = role;
   }
   //会話履歴をクリア
   chatHistory.clear();
@@ -1103,6 +1208,15 @@ void setup()
     }
   } else {
     Serial.println("An Error has occurred while mounting SPIFFS");
+  }
+
+  if (SYSTEM_ROLE_TEXT.length() > 0) {
+    init_chat_doc(json_ChatString.c_str());
+    chat_doc["instructions"] = SYSTEM_ROLE_TEXT;
+    chatHistory.clear();
+    InitBuffer = "";
+    serializeJson(chat_doc, InitBuffer);
+    Role_JSON = InitBuffer;
   }
 
   server.begin();
